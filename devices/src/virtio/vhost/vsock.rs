@@ -9,10 +9,10 @@ use super::super::{ActivateError, ActivateResult, Queue, VirtioDevice};
 use super::handle::*;
 use super::*;
 
-use memory_model::GuestMemory;
 use sys_util::EventFd;
 use vhost_backend::Vhost;
 use vhost_backend::Vsock as VhostVsockFd;
+use vm_memory::GuestMemory;
 
 use byteorder::{ByteOrder, LittleEndian};
 use epoll;

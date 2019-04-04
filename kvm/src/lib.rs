@@ -355,7 +355,7 @@ impl VmFd {
     /// * `offset` - Physical address of a three-page region in the guest's physical address space.
     ///
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    pub fn set_tss_address(&self, offset: usize) -> Result<()> {
+    pub fn set_tss_address(&self, offset: u64) -> Result<()> {
         // Safe because we know that our file is a VM fd and we verify the return result.
         let ret = unsafe { ioctl_with_val(self, KVM_SET_TSS_ADDR(), offset as c_ulong) };
         if ret == 0 {

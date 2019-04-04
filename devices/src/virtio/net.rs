@@ -27,12 +27,12 @@ use super::{
 };
 use dumbo::{ns::MmdsNetworkStack, pdu::ethernet::EthernetFrame};
 use logger::{Metric, METRICS};
-use memory_model::{GuestAddress, GuestMemory};
 use net_gen;
 use net_util::{MacAddr, Tap, TapError, MAC_ADDR_LEN};
 use rate_limiter::{RateLimiter, TokenType};
 use sys_util::EventFd;
 use virtio_gen::virtio_net::*;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use {DeviceEventT, EpollHandler};
 
 /// The maximum buffer size when segmentation offload is enabled. This
@@ -150,7 +150,7 @@ fn init_vnet_hdr(buf: &mut [u8]) {
 struct NetEpollHandler {
     rx: RxVirtio,
     tap: Tap,
-    mem: GuestMemory,
+    mem: GuestMemoryMmap,
     tx: TxVirtio,
     interrupt_status: Arc<AtomicUsize>,
     interrupt_evt: EventFd,
@@ -235,7 +235,7 @@ impl NetEpollHandler {
                     }
                     let limit = cmp::min(write_count + desc.len as usize, self.rx.bytes_read);
                     let source_slice = &self.rx.frame_buf[write_count..limit];
-                    let write_result = self.mem.write_slice_at_addr(source_slice, desc.addr);
+                    let write_result = self.mem.write(source_slice, desc.addr);
 
                     match write_result {
                         Ok(sz) => {
@@ -447,7 +447,7 @@ impl NetEpollHandler {
             for (desc_addr, desc_len) in self.tx.iovec.drain(..) {
                 let limit = cmp::min((read_count + desc_len) as usize, self.tx.frame_buf.len());
 
-                let read_result = self.mem.read_slice_at_addr(
+                let read_result = self.mem.read(
                     &mut self.tx.frame_buf[read_count..limit as usize],
                     desc_addr,
                 );
@@ -818,7 +818,7 @@ impl VirtioDevice for Net {
 
     fn activate(
         &mut self,
-        mem: GuestMemory,
+        mem: GuestMemoryMmap,
         interrupt_evt: EventFd,
         status: Arc<AtomicUsize>,
         mut queues: Vec<Queue>,
@@ -959,8 +959,8 @@ mod tests {
     use libc;
 
     use super::*;
-    use memory_model::GuestAddress;
     use virtio::queue::tests::*;
+    use vm_memory::GuestAddress;
 
     use dumbo::pdu::{arp, ethernet};
     use rate_limiter::TokenBucket;
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     fn activate_some_net(n: &mut Net, bad_qlen: bool, bad_evtlen: bool) -> ActivateResult {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let interrupt_evt = EventFd::new().unwrap();
         let status = Arc::new(AtomicUsize::new(0));
 
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[allow(clippy::needless_lifetimes)]
     fn default_test_netepollhandler<'a>(
-        mem: &'a GuestMemory,
+        mem: &'a GuestMemoryMmap,
         test_mutators: TestMutators,
     ) -> (NetEpollHandler, VirtQueue<'a>, VirtQueue<'a>) {
         let mut dummy = DummyNet::new(None);
@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn test_mmds_detour_and_injection() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let sha = MacAddr::parse_str("11:11:11:11:11:11").unwrap();
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_mac_spoofing_detection() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let guest_mac = MacAddr::parse_str("11:11:11:11:11:11").unwrap();
@@ -1475,7 +1475,7 @@ mod tests {
 
     #[test]
     fn test_handler_error_cases() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         // RX rate limiter events should error since the limiter is not blocked.
@@ -1497,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_invalid_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let bad_event = 1000;
@@ -1521,7 +1521,7 @@ mod tests {
         let test_mutators = TestMutators {
             tap_read_fail: true,
         };
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, test_mutators);
         let r = h.handle_event(RX_TAP_EVENT, 0, EpollHandlerPayload::Empty);
         match r {
@@ -1532,7 +1532,7 @@ mod tests {
 
     #[test]
     fn test_rx_rate_limited_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
         let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
         h.set_rx_rate_limiter(rl);
@@ -1545,7 +1545,7 @@ mod tests {
 
     #[test]
     fn test_tx_rate_limited_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
         let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
         h.set_tx_rate_limiter(rl);
@@ -1558,7 +1558,7 @@ mod tests {
 
     #[test]
     fn test_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1696,7 +1696,7 @@ mod tests {
             let test_mutators = TestMutators {
                 tap_read_fail: true,
             };
-            let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
             let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, test_mutators);
 
             check_metric_after_block!(&METRICS.net.rx_fails, 1, h.process_rx());
@@ -1705,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_rate_limiter() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1812,7 +1812,7 @@ mod tests {
 
     #[test]
     fn test_ops_rate_limiter() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1927,7 +1927,7 @@ mod tests {
 
     #[test]
     fn test_patch_rate_limiters() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _, _) = default_test_netepollhandler(&mem, TestMutators::default());
 
         h.set_rx_rate_limiter(RateLimiter::new(10, None, 10, 2, None, 2).unwrap());

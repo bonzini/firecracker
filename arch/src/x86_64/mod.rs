@@ -14,18 +14,20 @@ pub mod regs;
 use std::mem;
 
 use arch_gen::x86::bootparam::{boot_params, E820_RAM};
-use memory_model::{DataInit, GuestAddress, GuestMemory};
+use vm_memory::{
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestUsize,
+};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
-// trait (in this case `DataInit`) where:
+// trait (in this case `ByteValued`) where:
 // *    the type that is implementing the trait is foreign or
 // *    all of the parameters being passed to the trait (if there are any) are also foreign
 // is prohibited.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct BootParamsWrapper(boot_params);
 
 // It is safe to initialize BootParamsWrap which is a wrapper over `boot_params` (a series of ints).
-unsafe impl DataInit for BootParamsWrapper {}
+unsafe impl ByteValued for BootParamsWrapper {}
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -46,15 +48,15 @@ impl From<Error> for super::Error {
 }
 
 // Where BIOS/VGA magic would live on a real PC.
-const EBDA_START: u64 = 0x9fc00;
-const FIRST_ADDR_PAST_32BITS: usize = (1 << 32);
-const MEM_32BIT_GAP_SIZE: usize = (768 << 20);
+const EBDA_START: GuestUsize = 0x9fc00;
+const FIRST_ADDR_PAST_32BITS: GuestUsize = (1 << 32);
+const MEM_32BIT_GAP_SIZE: GuestUsize = (768 << 20);
 
 /// Returns a Vec of the valid memory addresses.
 /// These should be used to configure the GuestMemory structure for the platform.
 /// For x86_64 all addresses are valid from the start of the kernel except a
 /// carve out at the end of 32bit address space.
-pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
+pub fn arch_memory_regions(size: GuestUsize) -> Vec<(GuestAddress, usize)> {
     let memory_gap_start = GuestAddress(FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE);
     let memory_gap_end = GuestAddress(FIRST_ADDR_PAST_32BITS);
     let requested_memory_size = GuestAddress(size);
@@ -62,14 +64,14 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
 
     // case1: guest memory fits before the gap
     if requested_memory_size <= memory_gap_start {
-        regions.push((GuestAddress(0), size));
+        regions.push((GuestAddress(0), size as usize));
     // case2: guest memory extends beyond the gap
     } else {
         // push memory before the gap
-        regions.push((GuestAddress(0), memory_gap_start.offset()));
+        regions.push((GuestAddress(0), memory_gap_start.raw_value() as usize));
         regions.push((
             memory_gap_end,
-            requested_memory_size.offset_from(memory_gap_start),
+            requested_memory_size.unchecked_offset_from(memory_gap_start) as usize,
         ));
     }
 
@@ -77,7 +79,7 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
 }
 
 /// X86 specific memory hole/memory mapped devices/reserved area.
-pub fn get_32bit_gap_start() -> usize {
+pub fn get_32bit_gap_start() -> GuestUsize {
     FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE
 }
 
@@ -90,7 +92,7 @@ pub fn get_32bit_gap_start() -> usize {
 /// * `cmdline_size` - Size of the kernel command line in bytes including the null terminator.
 /// * `num_cpus` - Number of virtual CPUs the guest will have.
 pub fn configure_system(
-    guest_mem: &GuestMemory,
+    guest_mem: &GuestMemoryMmap,
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
     num_cpus: u8,
@@ -112,7 +114,7 @@ pub fn configure_system(
     params.0.hdr.type_of_loader = KERNEL_LOADER_OTHER;
     params.0.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
     params.0.hdr.header = KERNEL_HDR_MAGIC;
-    params.0.hdr.cmd_line_ptr = cmdline_addr.offset() as u32;
+    params.0.hdr.cmd_line_ptr = cmdline_addr.raw_value() as u32;
     params.0.hdr.cmdline_size = cmdline_size as u32;
     params.0.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
 
@@ -122,22 +124,22 @@ pub fn configure_system(
     if mem_end < end_32bit_gap_start {
         add_e820_entry(
             &mut params.0,
-            himem_start.offset() as u64,
-            mem_end.offset_from(himem_start) as u64,
+            himem_start.raw_value(),
+            mem_end.unchecked_offset_from(himem_start),
             E820_RAM,
         )?;
     } else {
         add_e820_entry(
             &mut params.0,
-            himem_start.offset() as u64,
-            end_32bit_gap_start.offset_from(himem_start) as u64,
+            himem_start.raw_value(),
+            end_32bit_gap_start.unchecked_offset_from(himem_start),
             E820_RAM,
         )?;
         if mem_end > first_addr_past_32bits {
             add_e820_entry(
                 &mut params.0,
-                first_addr_past_32bits.offset() as u64,
-                mem_end.offset_from(first_addr_past_32bits) as u64,
+                first_addr_past_32bits.raw_value(),
+                mem_end.unchecked_offset_from(first_addr_past_32bits),
                 E820_RAM,
             )?;
         }
@@ -148,7 +150,7 @@ pub fn configure_system(
         .checked_offset(zero_page_addr, mem::size_of::<boot_params>())
         .ok_or(Error::ZeroPagePastRamEnd)?;
     guest_mem
-        .write_obj_at_addr(params, zero_page_addr)
+        .write_obj(params, zero_page_addr)
         .map_err(|_| Error::ZeroPageSetup)?;
 
     Ok(())
@@ -181,7 +183,7 @@ mod tests {
 
     #[test]
     fn regions_lt_4gb() {
-        let regions = arch_memory_regions(1usize << 29);
+        let regions = arch_memory_regions(1u64 << 29);
         assert_eq!(1, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
         assert_eq!(1usize << 29, regions[0].1);
@@ -189,10 +191,10 @@ mod tests {
 
     #[test]
     fn regions_gt_4gb() {
-        let regions = arch_memory_regions((1usize << 32) + 0x8000);
+        let regions = arch_memory_regions((1u64 << 32) + 0x8000);
         assert_eq!(2, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
-        assert_eq!(GuestAddress(1usize << 32), regions[1].0);
+        assert_eq!(GuestAddress(1u64 << 32), regions[1].0);
     }
 
     #[test]
@@ -206,7 +208,7 @@ mod tests {
     #[test]
     fn test_system_configuration() {
         let no_vcpus = 4;
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let gm = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let config_err = configure_system(&gm, GuestAddress(0), 0, 1);
         assert!(config_err.is_err());
         assert_eq!(
@@ -219,19 +221,19 @@ mod tests {
         // Now assigning some memory that falls before the 32bit memory hole.
         let mem_size = 128 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
-        let gm = GuestMemory::new(&arch_mem_regions).unwrap();
+        let gm = GuestMemoryMmap::new(&arch_mem_regions).unwrap();
         configure_system(&gm, GuestAddress(0), 0, no_vcpus).unwrap();
 
         // Now assigning some memory that is equal to the start of the 32bit memory hole.
         let mem_size = 3328 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
-        let gm = GuestMemory::new(&arch_mem_regions).unwrap();
+        let gm = GuestMemoryMmap::new(&arch_mem_regions).unwrap();
         configure_system(&gm, GuestAddress(0), 0, no_vcpus).unwrap();
 
         // Now assigning some memory that falls after the 32bit memory hole.
         let mem_size = 3330 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
-        let gm = GuestMemory::new(&arch_mem_regions).unwrap();
+        let gm = GuestMemoryMmap::new(&arch_mem_regions).unwrap();
         configure_system(&gm, GuestAddress(0), 0, no_vcpus).unwrap();
     }
 

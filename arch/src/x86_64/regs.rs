@@ -11,12 +11,12 @@ use super::gdt::{gdt_entry, kvm_segment_from_gdt};
 use arch_gen::x86::msr_index;
 use kvm::VcpuFd;
 use kvm_bindings::{kvm_fpu, kvm_msr_entry, kvm_msrs, kvm_regs, kvm_sregs};
-use memory_model::{GuestAddress, GuestMemory};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestUsize};
 
 // Initial pagetables.
-const PML4_START: usize = 0x9000;
-const PDPTE_START: usize = 0xa000;
-const PDE_START: usize = 0xb000;
+const PML4_START: GuestUsize = 0x9000;
+const PDPTE_START: GuestUsize = 0xa000;
+const PDE_START: GuestUsize = 0xb000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -118,7 +118,7 @@ pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> Result<()> {
 ///
 /// * `mem` - The memory that will be passed to the guest.
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-pub fn setup_sregs(mem: &GuestMemory, vcpu: &VcpuFd) -> Result<()> {
+pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<()> {
     let mut sregs: kvm_sregs = vcpu.get_sregs().map_err(Error::GetStatusRegisters)?;
 
     configure_segments_and_sregs(mem, &mut sregs)?;
@@ -127,8 +127,8 @@ pub fn setup_sregs(mem: &GuestMemory, vcpu: &VcpuFd) -> Result<()> {
     vcpu.set_sregs(&sregs).map_err(Error::SetStatusRegisters)
 }
 
-const BOOT_GDT_OFFSET: usize = 0x500;
-const BOOT_IDT_OFFSET: usize = 0x520;
+const BOOT_GDT_OFFSET: GuestUsize = 0x500;
+const BOOT_IDT_OFFSET: GuestUsize = 0x520;
 
 const BOOT_GDT_MAX: usize = 4;
 
@@ -139,27 +139,27 @@ const X86_CR0_PE: u64 = 0x1;
 const X86_CR0_PG: u64 = 0x8000_0000;
 const X86_CR4_PAE: u64 = 0x20;
 
-fn write_gdt_table(table: &[u64], guest_mem: &GuestMemory) -> Result<()> {
+fn write_gdt_table(table: &[u64], guest_mem: &GuestMemoryMmap) -> Result<()> {
     let boot_gdt_addr = GuestAddress(BOOT_GDT_OFFSET);
     for (index, entry) in table.iter().enumerate() {
         let addr = guest_mem
             .checked_offset(boot_gdt_addr, index * mem::size_of::<u64>())
             .ok_or(Error::WriteGDT)?;
         guest_mem
-            .write_obj_at_addr(*entry, addr)
+            .write_obj(*entry, addr)
             .map_err(|_| Error::WriteGDT)?;
     }
     Ok(())
 }
 
-fn write_idt_value(val: u64, guest_mem: &GuestMemory) -> Result<()> {
+fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
     let boot_idt_addr = GuestAddress(BOOT_IDT_OFFSET);
     guest_mem
-        .write_obj_at_addr(val, boot_idt_addr)
+        .write_obj(val, boot_idt_addr)
         .map_err(|_| Error::WriteIDT)
 }
 
-fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Result<()> {
+fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
     let gdt_table: [u64; BOOT_GDT_MAX as usize] = [
         gdt_entry(0, 0, 0),            // NULL
         gdt_entry(0xa09b, 0, 0xfffff), // CODE
@@ -195,30 +195,30 @@ fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Res
     Ok(())
 }
 
-fn setup_page_tables(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Result<()> {
+fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
     // Puts PML4 right after zero page but aligned to 4k.
     let boot_pml4_addr = GuestAddress(PML4_START);
     let boot_pdpte_addr = GuestAddress(PDPTE_START);
     let boot_pde_addr = GuestAddress(PDE_START);
 
     // Entry covering VA [0..512GB)
-    mem.write_obj_at_addr(boot_pdpte_addr.offset() as u64 | 0x03, boot_pml4_addr)
+    mem.write_obj(boot_pdpte_addr.raw_value() as u64 | 0x03, boot_pml4_addr)
         .map_err(|_| Error::WritePML4Address)?;
 
     // Entry covering VA [0..1GB)
-    mem.write_obj_at_addr(boot_pde_addr.offset() as u64 | 0x03, boot_pdpte_addr)
+    mem.write_obj(boot_pde_addr.raw_value() as u64 | 0x03, boot_pdpte_addr)
         .map_err(|_| Error::WritePDPTEAddress)?;
     // 512 2MB entries together covering VA [0..1GB). Note we are assuming
     // CPU supports 2MB pages (/proc/cpuinfo has 'pse'). All modern CPUs do.
     for i in 0..512 {
-        mem.write_obj_at_addr(
+        mem.write_obj(
             (i << 21) + 0x83u64,
-            boot_pde_addr.unchecked_add((i * 8) as usize),
+            boot_pde_addr.unchecked_add((i * 8) as GuestUsize),
         )
         .map_err(|_| Error::WritePDEAddress)?;
     }
 
-    sregs.cr3 = boot_pml4_addr.offset() as u64;
+    sregs.cr3 = boot_pml4_addr.raw_value() as u64;
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PG;
     Ok(())
@@ -287,15 +287,15 @@ fn create_msr_entries() -> Vec<kvm_msr_entry> {
 mod tests {
     use super::*;
     use kvm::Kvm;
-    use memory_model::{GuestAddress, GuestMemory};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-    fn create_guest_mem() -> GuestMemory {
-        GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap()
+    fn create_guest_mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap()
     }
 
-    fn read_u64(gm: &GuestMemory, offset: usize) -> u64 {
+    fn read_u64(gm: &GuestMemoryMmap, offset: GuestUsize) -> u64 {
         let read_addr = GuestAddress(offset);
-        gm.read_obj_from_addr(read_addr).unwrap()
+        gm.read_obj(read_addr).unwrap()
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         for i in 0..512 {
             assert_eq!(
                 (i << 21) + 0x83u64,
-                read_u64(&gm, PDE_START + (i * 8) as usize)
+                read_u64(&gm, PDE_START + (i * 8) as GuestUsize)
             );
         }
 

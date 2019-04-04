@@ -13,7 +13,6 @@ extern crate libc;
 extern crate dumbo;
 #[macro_use]
 extern crate logger;
-extern crate memory_model;
 extern crate net_gen;
 extern crate net_util;
 extern crate rate_limiter;
@@ -23,6 +22,7 @@ extern crate vhost_backend;
 #[cfg(feature = "vsock")]
 extern crate vhost_gen;
 extern crate virtio_gen;
+extern crate vm_memory;
 
 use rate_limiter::{Error as RateLimiterError, TokenBucket};
 use std::fs::File;

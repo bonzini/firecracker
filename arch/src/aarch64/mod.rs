@@ -5,7 +5,7 @@ pub mod layout;
 
 use std::cmp::min;
 
-use memory_model::{GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 /// Returns a Vec of the valid memory addresses for aarch64.
 /// See [`layout`](layout) module for a drawing of the specific memory model for this platform.

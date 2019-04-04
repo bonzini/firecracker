@@ -8,21 +8,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::{ioctl_error, Error, Result, Vhost};
-use memory_model::GuestMemory;
 use sys_util::ioctl_with_ref;
 use vhost_gen::*;
+use vm_memory::GuestMemoryMmap;
 
 const VHOST_PATH: &str = "/dev/vhost-vsock";
 
 /// Handle for running VHOST_VSOCK ioctls.
 pub struct Vsock {
     fd: File,
-    mem: GuestMemory,
+    mem: GuestMemoryMmap,
 }
 
 impl Vsock {
     /// Open a handle to a new VHOST-VSOCK instance.
-    pub fn new(mem: &GuestMemory) -> Result<Vsock> {
+    pub fn new(mem: &GuestMemoryMmap) -> Result<Vsock> {
         Ok(Vsock {
             fd: OpenOptions::new()
                 .read(true)
@@ -69,7 +69,7 @@ impl Vsock {
 }
 
 impl Vhost for Vsock {
-    fn mem(&self) -> &GuestMemory {
+    fn mem(&self) -> &GuestMemoryMmap {
         &self.mem
     }
 }

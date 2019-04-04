@@ -30,11 +30,11 @@ extern crate kernel;
 extern crate kvm;
 #[macro_use]
 extern crate logger;
-extern crate memory_model;
 extern crate net_util;
 extern crate rate_limiter;
 extern crate seccomp;
 extern crate sys_util;
+extern crate vm_memory;
 
 /// Syscalls allowed through the seccomp filter.
 pub mod default_syscalls;
@@ -73,12 +73,12 @@ use kernel::loader as kernel_loader;
 use kvm::*;
 use logger::error::LoggerError;
 use logger::{AppInfo, Level, LogOption, Metric, LOGGER, METRICS};
-use memory_model::{GuestAddress, GuestMemory};
 #[cfg(target_arch = "aarch64")]
 use serde_json::Value;
 pub use sigsys_handler::setup_sigsys_handler;
 use sys_util::{EventFd, Terminal};
 use vm_control::VmResponse;
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestUsize};
 use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
 use vmm_config::instance_info::{InstanceInfo, InstanceState, StartMicrovmError};
@@ -586,7 +586,7 @@ struct Vmm {
     shared_info: Arc<RwLock<InstanceInfo>>,
 
     // Guest VM core resources.
-    guest_memory: Option<GuestMemory>,
+    guest_memory: Option<GuestMemoryMmap>,
     kernel_config: Option<KernelConfig>,
     vcpus_handles: Vec<thread::JoinHandle<()>>,
     exit_evt: Option<EpollEvent<EventFd>>,
@@ -845,7 +845,7 @@ impl Vmm {
     fn attach_vsock_devices(
         &mut self,
         device_manager: &mut MMIODeviceManager,
-        guest_mem: &GuestMemory,
+        guest_mem: &GuestMemoryMmap,
     ) -> std::result::Result<(), StartMicrovmError> {
         let kernel_config = self
             .kernel_config
@@ -903,23 +903,20 @@ impl Vmm {
     }
 
     fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        let mem_size = self
+        let mem_size = (self
             .vm_config
             .mem_size_mib
-            .ok_or(StartMicrovmError::GuestMemory(
-                memory_model::GuestMemoryError::MemoryNotInitialized,
-            ))?
+            .ok_or(StartMicrovmError::MemoryNotInitialized)? as GuestUsize)
             << 20;
         let arch_mem_regions = arch::arch_memory_regions(mem_size);
-        self.guest_memory =
-            Some(GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?);
+        self.guest_memory = Some(
+            GuestMemoryMmap::new(&arch_mem_regions[..]).map_err(StartMicrovmError::GuestMemory)?,
+        );
         self.vm
             .memory_init(
                 self.guest_memory
                     .clone()
-                    .ok_or(StartMicrovmError::GuestMemory(
-                        memory_model::GuestMemoryError::MemoryNotInitialized,
-                    ))?,
+                    .ok_or(StartMicrovmError::MemoryNotInitialized)?,
                 &self.kvm,
             )
             .map_err(StartMicrovmError::ConfigureVm)?;
@@ -937,9 +934,7 @@ impl Vmm {
         let guest_mem = self
             .guest_memory
             .clone()
-            .ok_or(StartMicrovmError::GuestMemory(
-                memory_model::GuestMemoryError::MemoryNotInitialized,
-            ))?;
+            .ok_or(StartMicrovmError::MemoryNotInitialized)?;
 
         // Instantiate the MMIO device manager.
         // 'mmio_base' address has to be an address which is protected by the kernel.
@@ -1089,9 +1084,10 @@ impl Vmm {
         })?;
 
         // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
-        let vm_memory = self.vm.get_memory().ok_or(StartMicrovmError::GuestMemory(
-            memory_model::GuestMemoryError::MemoryNotInitialized,
-        ))?;
+        let vm_memory = self
+            .vm
+            .get_memory()
+            .ok_or(StartMicrovmError::MemoryNotInitialized)?;
         let entry_addr = kernel_loader::load_kernel(
             vm_memory,
             &mut kernel_config.kernel_file,
@@ -1367,7 +1363,7 @@ impl Vmm {
                     let bitmap = self
                         .vm
                         .get_fd()
-                        .get_dirty_log(slot as u32, memory_region.size());
+                        .get_dirty_log(slot as u32, memory_region.len() as usize);
                     match bitmap {
                         Ok(v) => v
                             .iter()
@@ -2073,7 +2069,7 @@ mod tests {
         #[allow(unused_mut)]
         fn activate(
             &mut self,
-            mem: GuestMemory,
+            mem: GuestMemoryMmap,
             interrupt_evt: EventFd,
             status: Arc<AtomicUsize>,
             queues: Vec<devices::virtio::Queue>,

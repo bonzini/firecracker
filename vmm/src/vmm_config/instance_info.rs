@@ -7,8 +7,8 @@ use std::fmt::{Display, Formatter, Result};
 use device_manager;
 use devices;
 use kernel::loader as kernel_loader;
-use memory_model::GuestMemoryError;
 use seccomp;
+use vm_memory::mmap::MmapError;
 use vstate;
 
 /// The microvm state. When Firecracker starts, the instance state is Uninitialized.
@@ -68,7 +68,7 @@ pub enum StartMicrovmError {
     /// Cannot read from an Event file descriptor.
     EventFd,
     /// Memory regions are overlapping or mmap fails.
-    GuestMemory(GuestMemoryError),
+    GuestMemory(MmapError),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// Cannot load kernel due to invalid memory configuration or invalid kernel image.
@@ -77,6 +77,8 @@ pub enum StartMicrovmError {
     LegacyIOBus(device_manager::legacy::Error),
     /// Cannot load command line string.
     LoadCommandline(kernel_loader::Error),
+    /// The start command was issued more than once.
+    MemoryNotInitialized,
     /// The start command was issued more than once.
     MicroVMAlreadyRunning,
     /// Cannot start the VM because the kernel was not configured.
@@ -178,6 +180,7 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace("\"", "");
                 write!(f, "Cannot load command line string. {}", err_msg)
             }
+            MemoryNotInitialized => write!(f, "Failure in initializing guest memory."),
             MicroVMAlreadyRunning => write!(f, "Microvm already running."),
             MissingKernelConfig => write!(f, "Cannot start microvm without kernel configuration."),
             NetDeviceNotConfigured => {

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::*;
-use memory_model::{GuestAddress, GuestMemory};
 use sys_util::EventFd;
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 use BusDevice;
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
@@ -56,7 +56,7 @@ pub trait VirtioDevice: Send {
     /// Activates this device for real usage.
     fn activate(
         &mut self,
-        mem: GuestMemory,
+        mem: GuestMemoryMmap,
         interrupt_evt: EventFd,
         status: Arc<AtomicUsize>,
         queues: Vec<Queue>,
@@ -97,12 +97,12 @@ pub struct MmioDevice {
     config_generation: u32,
     queues: Vec<Queue>,
     queue_evts: Vec<EventFd>,
-    mem: Option<GuestMemory>,
+    mem: Option<GuestMemoryMmap>,
 }
 
 impl MmioDevice {
     /// Constructs a new MMIO transport for the given virtio device.
-    pub fn new(mem: GuestMemory, device: Box<VirtioDevice>) -> std::io::Result<MmioDevice> {
+    pub fn new(mem: GuestMemoryMmap, device: Box<VirtioDevice>) -> std::io::Result<MmioDevice> {
         let mut queue_evts = Vec::new();
         for _ in device.queue_max_sizes().iter() {
             queue_evts.push(EventFd::new()?)
@@ -448,7 +448,7 @@ mod tests {
 
         fn activate(
             &mut self,
-            _mem: GuestMemory,
+            _mem: GuestMemoryMmap,
             interrupt_evt: EventFd,
             _status: Arc<AtomicUsize>,
             _queues: Vec<Queue>,
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut dummy = DummyDevice::new();
         // Validate reset is no-op.
         assert!(dummy.reset().is_none());
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_read() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
 
         let mut buf = vec![0xff, 0, 0xfe, 0];
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     #[allow(clippy::cyclomatic_complexity)]
     fn test_bus_device_write() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
 
         let dummy_box = Box::new(DummyDevice::new());
         let p = &dummy_box.acked_features as *const u32;
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_activate() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
 
         assert!(!d.are_queues_valid());
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_reset() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
         let mut buf = vec![0; 4];
 

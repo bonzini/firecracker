@@ -17,8 +17,10 @@ use default_syscalls;
 use kvm::*;
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use logger::{LogOption, Metric, LOGGER, METRICS};
-use memory_model::{GuestAddress, GuestMemory, GuestMemoryError};
 use sys_util::EventFd;
+use vm_memory::{
+    Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+};
 #[cfg(target_arch = "x86_64")]
 use vmm_config::machine_config::CpuFeaturesTemplate;
 use vmm_config::machine_config::VmConfig;
@@ -40,6 +42,8 @@ pub enum Error {
     HTNotInitialized,
     /// vCPU count is not initialized.
     VcpuCountNotInitialized,
+    /// Memory is not initialized.
+    MemoryNotInitialized,
     /// Cannot open the VM file descriptor.
     VmFd(io::Error),
     /// Cannot open the VCPU file descriptor.
@@ -89,7 +93,7 @@ pub struct Vm {
     fd: VmFd,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     supported_cpuid: CpuId,
-    guest_mem: Option<GuestMemory>,
+    guest_mem: Option<GuestMemoryMmap>,
 }
 
 impl Vm {
@@ -116,13 +120,15 @@ impl Vm {
     }
 
     /// Initializes the guest memory.
-    pub fn memory_init(&mut self, guest_mem: GuestMemory, kvm_context: &KvmContext) -> Result<()> {
+    pub fn memory_init(
+        &mut self,
+        guest_mem: GuestMemoryMmap,
+        kvm_context: &KvmContext,
+    ) -> Result<()> {
         if guest_mem.num_regions() > kvm_context.max_memslots() {
             return Err(Error::NotEnoughMemorySlots);
         }
-        guest_mem.with_regions(|index, guest_addr, size, host_addr| {
-            info!("Guest memory starts at {:x?}", host_addr);
-
+        guest_mem.with_regions_mut(|index, region| {
             let flags = if LOGGER.flags() & LogOption::LogDirtyPages as usize > 0 {
                 KVM_MEM_LOG_DIRTY_PAGES
             } else {
@@ -131,18 +137,20 @@ impl Vm {
 
             let memory_region = kvm_userspace_memory_region {
                 slot: index as u32,
-                guest_phys_addr: guest_addr.offset() as u64,
-                memory_size: size as u64,
-                userspace_addr: host_addr as u64,
+                guest_phys_addr: region.min_addr().raw_value(),
+                memory_size: region.len() as u64,
+                userspace_addr: region.as_ptr() as usize as u64,
                 flags,
             };
+            info!("Guest memory starts at {:x?}", memory_region.userspace_addr);
+
             self.fd.set_user_memory_region(memory_region)
         })?;
         self.guest_mem = Some(guest_mem);
 
         #[cfg(target_arch = "x86_64")]
         self.fd
-            .set_tss_address(GuestAddress(arch::x86_64::layout::KVM_TSS_ADDRESS).offset())
+            .set_tss_address(GuestAddress(arch::x86_64::layout::KVM_TSS_ADDRESS).raw_value())
             .map_err(Error::VmSetup)?;
 
         Ok(())
@@ -177,9 +185,9 @@ impl Vm {
 
     /// Gets a reference to the guest memory owned by this VM.
     ///
-    /// Note that `GuestMemory` does not include any device memory that may have been added after
+    /// Note that `GuestMemoryMmap` does not include any device memory that may have been added after
     /// this VM was constructed.
-    pub fn get_memory(&self) -> Option<&GuestMemory> {
+    pub fn get_memory(&self) -> Option<&GuestMemoryMmap> {
         self.guest_mem.as_ref()
     }
 
@@ -267,10 +275,8 @@ impl Vcpu {
 
         arch::x86_64::regs::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
         // Safe to unwrap because this method is called after the VM is configured
-        let vm_memory = vm
-            .get_memory()
-            .ok_or(Error::GuestMemory(GuestMemoryError::MemoryNotInitialized))?;
-        arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.offset() as u64)
+        let vm_memory = vm.get_memory().ok_or(Error::MemoryNotInitialized)?;
+        arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.raw_value() as u64)
             .map_err(Error::REGSConfiguration)?;
         arch::x86_64::regs::setup_fpu(&self.fd).map_err(Error::FPUConfiguration)?;
         arch::x86_64::regs::setup_sregs(vm_memory, &self.fd).map_err(Error::SREGSConfiguration)?;
@@ -395,11 +401,12 @@ mod tests {
 
     use libc::{c_int, c_void, siginfo_t};
     use sys_util::{register_signal_handler, Killable, SignalHandler};
+    use vm_memory::Bytes;
 
     #[test]
     fn create_vm() {
         let kvm = KvmContext::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let gm = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(gm, &kvm).is_ok());
     }
@@ -407,25 +414,18 @@ mod tests {
     #[test]
     fn get_memory() {
         let kvm = KvmContext::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let gm = GuestMemoryMmap::new(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(gm, &kvm).is_ok());
         let obj_addr = GuestAddress(0xf0);
-        vm.get_memory()
-            .unwrap()
-            .write_obj_at_addr(67u8, obj_addr)
-            .unwrap();
-        let read_val: u8 = vm
-            .get_memory()
-            .unwrap()
-            .read_obj_from_addr(obj_addr)
-            .unwrap();
+        vm.get_memory().unwrap().write_obj(67u8, obj_addr).unwrap();
+        let read_val: u8 = vm.get_memory().unwrap().read_obj(obj_addr).unwrap();
         assert_eq!(read_val, 67u8);
     }
 
     fn setup_vcpu() -> (Vm, Vcpu) {
         let kvm = KvmContext::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let gm = GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(gm, &kvm).is_ok());
         let dummy_eventfd_1 = EventFd::new().unwrap();
@@ -527,7 +527,7 @@ mod tests {
         };
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let gm = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let gm = GuestMemoryMmap::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
 
         assert!(vm.memory_init(gm, &kvm).is_err());
     }
@@ -548,14 +548,14 @@ mod tests {
 
         let mem_size = 0x1000;
         let load_addr = GuestAddress(0x1000);
-        let mem = GuestMemory::new(&[(load_addr, mem_size)]).unwrap();
+        let mem = GuestMemoryMmap::new(&[(load_addr, mem_size)]).unwrap();
 
         let kvm = KvmContext::new().unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(mem, &kvm).is_ok());
         vm.get_memory()
             .unwrap()
-            .write_slice_at_addr(&code, load_addr)
+            .write_slice(&code, load_addr)
             .expect("Writing code to memory failed.");
 
         let vcpu = Vcpu::new(

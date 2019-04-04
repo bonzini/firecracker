@@ -4,9 +4,9 @@
 
 extern crate libc;
 
-extern crate memory_model;
 extern crate sys_util;
 extern crate vhost_gen;
+extern crate vm_memory;
 
 mod vsock;
 pub use vsock::Vsock;
@@ -15,9 +15,12 @@ use std::mem;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null;
 
-use memory_model::{GuestAddress, GuestMemory, GuestMemoryError};
 use sys_util::{ioctl, ioctl_with_mut_ref, ioctl_with_ptr, ioctl_with_ref, EventFd};
 use vhost_gen::*;
+use vm_memory::{
+    Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    GuestUsize,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -48,7 +51,7 @@ fn ioctl_error<T>() -> Result<T> {
 /// managing the control channel.
 pub trait Vhost: AsRawFd + std::marker::Sized {
     /// Get the guest memory mapping.
-    fn mem(&self) -> &GuestMemory;
+    fn mem(&self) -> &GuestMemoryMmap;
 
     /// Set the current process as the owner of this file descriptor.
     /// This must be run before any other vhost ioctls.
@@ -105,17 +108,15 @@ pub trait Vhost: AsRawFd + std::marker::Sized {
         // we correctly specify the size to match the amount of backing memory.
         let vhost_regions = unsafe { vhost_memory.regions.as_mut_slice(num_regions as usize) };
 
-        let _ = self
-            .mem()
-            .with_regions_mut::<_, ()>(|index, guest_addr, size, host_addr| {
-                vhost_regions[index] = vhost_memory_region {
-                    guest_phys_addr: guest_addr.offset() as u64,
-                    memory_size: size as u64,
-                    userspace_addr: host_addr as u64,
-                    flags_padding: 0u64,
-                };
-                Ok(())
-            });
+        let _ = self.mem().with_regions_mut::<_, ()>(|index, region| {
+            vhost_regions[index] = vhost_memory_region {
+                guest_phys_addr: region.min_addr().raw_value() as u64,
+                memory_size: region.len() as u64,
+                userspace_addr: region.as_ptr() as usize as u64,
+                flags_padding: 0u64,
+            };
+            Ok(())
+        });
 
         // This ioctl is called with a pointer that is valid for the lifetime
         // of this function. The kernel will make its own copy of the memory
@@ -156,9 +157,9 @@ pub trait Vhost: AsRawFd + std::marker::Sized {
         avail_addr: GuestAddress,
         used_addr: GuestAddress,
     ) -> bool {
-        let desc_table_size = 16 * queue_size as usize;
-        let avail_ring_size = 6 + 2 * queue_size as usize;
-        let used_ring_size = 6 + 8 * queue_size as usize;
+        let desc_table_size = 16 * queue_size as GuestUsize;
+        let avail_ring_size = 6 + 2 * queue_size as GuestUsize;
+        let used_ring_size = 6 + 8 * queue_size as GuestUsize;
         !(queue_size > queue_max_size
             || queue_size == 0
             || (queue_size & (queue_size - 1)) != 0
@@ -206,30 +207,39 @@ pub trait Vhost: AsRawFd + std::marker::Sized {
             return Err(Error::InvalidQueue);
         }
 
-        let desc_addr = self
-            .mem()
-            .get_host_address(desc_table_addr)
-            .map_err(Error::DescriptorTableAddress)?;
+        let desc_addr =
+            self.mem()
+                .get_host_address(desc_table_addr)
+                .ok_or(Error::DescriptorTableAddress(
+                    GuestMemoryError::InvalidGuestAddress(desc_table_addr),
+                ))?;
         let used_addr = self
             .mem()
             .get_host_address(used_ring_addr)
-            .map_err(Error::UsedAddress)?;
-        let avail_addr = self
-            .mem()
-            .get_host_address(avail_ring_addr)
-            .map_err(Error::AvailAddress)?;
+            .ok_or(Error::UsedAddress(GuestMemoryError::InvalidGuestAddress(
+                used_ring_addr,
+            )))?;
+        let avail_addr =
+            self.mem()
+                .get_host_address(avail_ring_addr)
+                .ok_or(Error::AvailAddress(GuestMemoryError::InvalidGuestAddress(
+                    avail_ring_addr,
+                )))?;
         let log_addr = match log_addr {
             None => null(),
-            Some(a) => self.mem().get_host_address(a).map_err(Error::LogAddress)?,
+            Some(a) => self
+                .mem()
+                .get_host_address(a)
+                .ok_or(Error::LogAddress(GuestMemoryError::InvalidGuestAddress(a)))?,
         };
 
         let vring_addr = vhost_vring_addr {
             index: queue_index as u32,
             flags,
-            desc_user_addr: desc_addr as u64,
-            used_user_addr: used_addr as u64,
-            avail_user_addr: avail_addr as u64,
-            log_guest_addr: log_addr as u64,
+            desc_user_addr: desc_addr as usize as u64,
+            used_user_addr: used_addr as usize as u64,
+            avail_user_addr: avail_addr as usize as u64,
+            log_guest_addr: log_addr as usize as u64,
         };
 
         // This ioctl is called on a valid vhost fd and has its

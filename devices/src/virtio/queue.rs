@@ -9,18 +9,20 @@ use std::cmp::min;
 use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
 
-use memory_model::{DataInit, GuestAddress, GuestMemory};
+use vm_memory::{
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestUsize,
+};
 
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 
-// GuestMemory::read_obj_from_addr() will be used to fetch the descriptor,
+// GuestMemoryMmap::read_obj() will be used to fetch the descriptor,
 // which has an explicit constraint that the entire descriptor doesn't
 // cross the page boundary. Otherwise the descriptor may be splitted into
-// two mmap regions which causes failure of GuestMemory::read_obj_from_addr().
+// two mmap regions which causes failure of GuestMemoryMmap::read_obj().
 //
 // The Virtio Spec 1.0 defines the alignment of VirtIO descriptor is 16 bytes,
-// which fulfills the explicit constraint of GuestMemory::read_obj_from_addr().
+// which fulfills the explicit constraint of GuestMemoryMmap::read_obj().
 
 /// A virtio descriptor constraints with C representive.
 #[repr(C)]
@@ -32,11 +34,11 @@ struct Descriptor {
     next: u16,
 }
 
-unsafe impl DataInit for Descriptor {}
+unsafe impl ByteValued for Descriptor {}
 
 /// A virtio descriptor chain.
 pub struct DescriptorChain<'a> {
-    mem: &'a GuestMemory,
+    mem: &'a GuestMemoryMmap,
     desc_table: GuestAddress,
     queue_size: u16,
     ttl: u16, // used to prevent infinite chain cycles
@@ -60,7 +62,7 @@ pub struct DescriptorChain<'a> {
 
 impl<'a> DescriptorChain<'a> {
     fn checked_new(
-        mem: &GuestMemory,
+        mem: &GuestMemoryMmap,
         desc_table: GuestAddress,
         queue_size: u16,
         index: u16,
@@ -76,7 +78,7 @@ impl<'a> DescriptorChain<'a> {
         mem.checked_offset(desc_head, 16)?;
 
         // These reads can't fail unless Guest memory is hopelessly broken.
-        let desc = match mem.read_obj_from_addr::<Descriptor>(desc_head) {
+        let desc = match mem.read_obj::<Descriptor>(desc_head) {
             Ok(ret) => ret,
             Err(_) => {
                 // TODO log address
@@ -90,7 +92,7 @@ impl<'a> DescriptorChain<'a> {
             queue_size,
             ttl: queue_size,
             index,
-            addr: GuestAddress(desc.addr as usize),
+            addr: GuestAddress(desc.addr),
             len: desc.len,
             flags: desc.flags,
             next: desc.next,
@@ -144,7 +146,7 @@ impl<'a> DescriptorChain<'a> {
 
 /// Consuming iterator over all available descriptor chain heads in the queue.
 pub struct AvailIter<'a, 'b> {
-    mem: &'a GuestMemory,
+    mem: &'a GuestMemoryMmap,
     desc_table: GuestAddress,
     avail_ring: GuestAddress,
     next_index: Wrapping<u16>,
@@ -154,7 +156,7 @@ pub struct AvailIter<'a, 'b> {
 }
 
 impl<'a, 'b> AvailIter<'a, 'b> {
-    pub fn new(mem: &'a GuestMemory, q_next_avail: &'b mut Wrapping<u16>) -> AvailIter<'a, 'b> {
+    pub fn new(mem: &'a GuestMemoryMmap, q_next_avail: &'b mut Wrapping<u16>) -> AvailIter<'a, 'b> {
         AvailIter {
             mem,
             desc_table: GuestAddress(0),
@@ -181,7 +183,7 @@ impl<'a, 'b> Iterator for AvailIter<'a, 'b> {
             None => return None,
         };
         // This index is checked below in checked_new
-        let desc_index: u16 = match self.mem.read_obj_from_addr(avail_addr) {
+        let desc_index: u16 = match self.mem.read_obj(avail_addr) {
             Ok(ret) => ret,
             Err(_) => {
                 // TODO log address
@@ -251,7 +253,7 @@ impl Queue {
         min(self.size, self.max_size)
     }
 
-    pub fn is_valid(&self, mem: &GuestMemory) -> bool {
+    pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
         let queue_size = self.actual_size() as usize;
         let desc_table = self.desc_table;
         let desc_table_size = 16 * queue_size;
@@ -267,42 +269,42 @@ impl Queue {
             error!("virtio queue with invalid size: {}", self.size);
             false
         } else if desc_table
-            .checked_add(desc_table_size)
+            .checked_add(desc_table_size as GuestUsize)
             .map_or(true, |v| !mem.address_in_range(v))
         {
             error!(
                 "virtio queue descriptor table goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                desc_table.offset(),
+                desc_table.raw_value(),
                 desc_table_size
             );
             false
         } else if avail_ring
-            .checked_add(avail_ring_size)
+            .checked_add(avail_ring_size as GuestUsize)
             .map_or(true, |v| !mem.address_in_range(v))
         {
             error!(
                 "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                avail_ring.offset(),
+                avail_ring.raw_value(),
                 avail_ring_size
             );
             false
         } else if used_ring
-            .checked_add(used_ring_size)
+            .checked_add(used_ring_size as GuestUsize)
             .map_or(true, |v| !mem.address_in_range(v))
         {
             error!(
                 "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                used_ring.offset(),
+                used_ring.raw_value(),
                 used_ring_size
             );
             false
-        } else if desc_table.offset() & 0xf != 0 {
+        } else if desc_table.mask(0xf) != 0 {
             error!("virtio queue descriptor table breaks alignment contraints");
             false
-        } else if avail_ring.offset() & 0x1 != 0 {
+        } else if avail_ring.mask(0x1) != 0 {
             error!("virtio queue available ring breaks alignment contraints");
             false
-        } else if used_ring.offset() & 0x3 != 0 {
+        } else if used_ring.mask(0x3) != 0 {
             error!("virtio queue used ring breaks alignment contraints");
             false
         } else {
@@ -311,7 +313,7 @@ impl Queue {
     }
 
     /// A consuming iterator over all available descriptor chain heads offered by the driver.
-    pub fn iter<'a, 'b>(&'b mut self, mem: &'a GuestMemory) -> AvailIter<'a, 'b> {
+    pub fn iter<'a, 'b>(&'b mut self, mem: &'a GuestMemoryMmap) -> AvailIter<'a, 'b> {
         let queue_size = self.actual_size();
         let avail_ring = self.avail_ring;
 
@@ -324,7 +326,7 @@ impl Queue {
             }
         };
         // Note that last_index has no invalid values
-        let last_index: u16 = match mem.read_obj_from_addr::<u16>(index_addr) {
+        let last_index: u16 = match mem.read_obj::<u16>(index_addr) {
             Ok(ret) => ret,
             Err(_) => return AvailIter::new(mem, &mut self.next_avail),
         };
@@ -341,7 +343,7 @@ impl Queue {
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.
-    pub fn add_used(&mut self, mem: &GuestMemory, desc_index: u16, len: u32) {
+    pub fn add_used(&mut self, mem: &GuestMemoryMmap, desc_index: u16, len: u32) {
         if desc_index >= self.actual_size() {
             error!(
                 "attempted to add out of bounds descriptor to used ring: {}",
@@ -351,13 +353,12 @@ impl Queue {
         }
 
         let used_ring = self.used_ring;
-        let next_used = (self.next_used.0 % self.actual_size()) as usize;
+        let next_used = (self.next_used.0 % self.actual_size()) as GuestUsize;
         let used_elem = used_ring.unchecked_add(4 + next_used * 8);
 
         // These writes can't fail as we are guaranteed to be within the descriptor ring.
-        mem.write_obj_at_addr(u32::from(desc_index), used_elem)
-            .unwrap();
-        mem.write_obj_at_addr(len as u32, used_elem.unchecked_add(4))
+        mem.write_obj(u32::from(desc_index), used_elem).unwrap();
+        mem.write_obj(len as u32, used_elem.unchecked_add(4))
             .unwrap();
 
         self.next_used += Wrapping(1);
@@ -365,7 +366,7 @@ impl Queue {
         // This fence ensures all descriptor writes are visible before the index update is.
         fence(Ordering::Release);
 
-        mem.write_obj_at_addr(self.next_used.0 as u16, used_ring.unchecked_add(2))
+        mem.write_obj(self.next_used.0 as u16, used_ring.unchecked_add(2))
             .unwrap();
     }
 
@@ -379,27 +380,27 @@ impl Queue {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    extern crate memory_model;
+    extern crate vm_memory;
 
     use std::marker::PhantomData;
     use std::mem;
 
     pub use super::*;
-    use memory_model::{GuestAddress, GuestMemory};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-    // Represents a location in GuestMemory which holds a given type.
+    // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {
         pub location: GuestAddress,
-        mem: &'a GuestMemory,
+        mem: &'a GuestMemoryMmap,
         phantom: PhantomData<*const T>,
     }
 
-    // The DataInit trait is required to use mem.read_obj_from_addr and write_obj_at_addr.
+    // The ByteValued trait is required to use mem.read_obj and write_obj.
     impl<'a, T> SomeplaceInMemory<'a, T>
     where
-        T: memory_model::DataInit,
+        T: vm_memory::ByteValued,
     {
-        fn new(location: GuestAddress, mem: &'a GuestMemory) -> Self {
+        fn new(location: GuestAddress, mem: &'a GuestMemoryMmap) -> Self {
             SomeplaceInMemory {
                 location,
                 mem,
@@ -409,12 +410,12 @@ pub(crate) mod tests {
 
         // Reads from the actual memory location.
         pub fn get(&self) -> T {
-            self.mem.read_obj_from_addr(self.location).unwrap()
+            self.mem.read_obj(self.location).unwrap()
         }
 
         // Writes to the actual memory location.
         pub fn set(&self, val: T) {
-            self.mem.write_obj_at_addr(val, self.location).unwrap()
+            self.mem.write_obj(val, self.location).unwrap()
         }
 
         // This function returns a place in memory which holds a value of type U, and starts
@@ -447,7 +448,7 @@ pub(crate) mod tests {
     }
 
     impl<'a> VirtqDesc<'a> {
-        fn new(start: GuestAddress, mem: &'a GuestMemory) -> Self {
+        fn new(start: GuestAddress, mem: &'a GuestMemoryMmap) -> Self {
             assert_eq!(start.0 & 0xf, 0);
 
             let addr = SomeplaceInMemory::new(start, mem);
@@ -490,9 +491,14 @@ pub(crate) mod tests {
 
     impl<'a, T> VirtqRing<'a, T>
     where
-        T: memory_model::DataInit,
+        T: vm_memory::ByteValued,
     {
-        fn new(start: GuestAddress, mem: &'a GuestMemory, qsize: u16, alignment: usize) -> Self {
+        fn new(
+            start: GuestAddress,
+            mem: &'a GuestMemoryMmap,
+            qsize: u16,
+            alignment: usize,
+        ) -> Self {
             assert_eq!(start.0 & (alignment - 1), 0);
 
             let flags = SomeplaceInMemory::new(start, mem);
@@ -533,7 +539,7 @@ pub(crate) mod tests {
         pub len: u32,
     }
 
-    unsafe impl memory_model::DataInit for VirtqUsedElem {}
+    unsafe impl vm_memory::ByteValued for VirtqUsedElem {}
 
     pub type VirtqAvail<'a> = VirtqRing<'a, u16>;
     pub type VirtqUsed<'a> = VirtqRing<'a, VirtqUsedElem>;
@@ -546,7 +552,7 @@ pub(crate) mod tests {
 
     impl<'a> VirtQueue<'a> {
         // We try to make sure things are aligned properly :-s
-        pub fn new(start: GuestAddress, mem: &'a GuestMemory, qsize: u16) -> Self {
+        pub fn new(start: GuestAddress, mem: &'a GuestMemoryMmap, qsize: u16) -> Self {
             // power of 2?
             assert!(qsize > 0 && qsize & (qsize - 1) == 0);
 
@@ -618,7 +624,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_checked_new_descriptor_chain() {
-        let m = &GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         assert!(vq.end().0 < 0x1000);
@@ -661,7 +667,7 @@ pub(crate) mod tests {
 
             let c = DescriptorChain::checked_new(m, vq.dtable_start(), 16, 0).unwrap();
 
-            assert_eq!(c.mem as *const GuestMemory, m as *const GuestMemory);
+            assert_eq!(c.mem as *const GuestMemoryMmap, m as *const GuestMemoryMmap);
             assert_eq!(c.desc_table, vq.dtable_start());
             assert_eq!(c.queue_size, 16);
             assert_eq!(c.ttl, c.queue_size);
@@ -677,7 +683,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_queue_and_iterator() {
-        let m = &GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();
@@ -782,7 +788,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_add_used() {
-        let m = &GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &GuestMemoryMmap::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();

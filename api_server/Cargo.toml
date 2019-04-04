@@ -24,7 +24,7 @@ vmm = { path = "../vmm" }
 arch = { path = "../arch" }
 devices = { path = "../devices" }
 kernel = { path = "../kernel" }
-memory_model = { path = "../memory_model" }
+vm-memory = { path = "../vm-memory" }
 net_util = { path = "../net_util" }
 rate_limiter = { path = "../rate_limiter" }
 

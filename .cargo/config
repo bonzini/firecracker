@@ -1,5 +1,5 @@
 [build]
-target = "x86_64-unknown-linux-musl"
+target = "x86_64-unknown-linux-gnu"
 
 [target.aarch64-unknown-linux-musl]
 # On aarch64 musl depends on some libgcc functions (i.e `__addtf3` and other `*tf3` functions) for logic that uses
